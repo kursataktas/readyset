@@ -90,6 +90,7 @@ mod set;
 mod show;
 mod sql_identifier;
 mod sql_type;
+mod sqlparser_shim;
 mod table;
 mod transaction;
 mod truncate;

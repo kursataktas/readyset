@@ -10,7 +10,7 @@ use nom::combinator::{map, map_res, opt};
 use nom::error::{ErrorKind, ParseError};
 use nom::multi::{separated_list0, separated_list1};
 use nom::sequence::{delimited, preceded, separated_pair, terminated, tuple};
-use nom::{Compare, CompareResult};
+use nom::{AsBytes, Compare, CompareResult, InputTake};
 use nom_locate::LocatedSpan;
 use readyset_util::fmt::fmt_with;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ use crate::order::{order_type, OrderType};
 use crate::select::{selection, SelectStatement};
 use crate::table::{relation, Relation};
 use crate::whitespace::{whitespace0, whitespace1};
-use crate::{Dialect, DialectDisplay, NomSqlError, NomSqlResult, SqlIdentifier};
+use crate::{Dialect, DialectDisplay, NomSqlError, NomSqlResult, SqlIdentifier, SqlQuery};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Arbitrary)]
 pub enum CharsetName {
@@ -1103,15 +1103,63 @@ fn cached_query_options(mut i: LocatedSpan<&[u8]>) -> NomSqlResult<&[u8], Create
 }
 
 /// Extract the [`SelectStatement`] or Query ID from a CREATE CACHE statement. Query ID is
-/// parsed as a SqlIdentifier
+/// parsed as a SqlIdentifier.
+///
+/// Parses the inner select using sqlparser-rs.
 pub fn cached_query_inner(
     dialect: Dialect,
 ) -> impl Fn(LocatedSpan<&[u8]>) -> NomSqlResult<&[u8], CacheInner> {
     move |i| {
-        alt((
-            map(map(selection(dialect), Box::new), CacheInner::from),
-            map(dialect.identifier(), CacheInner::from),
-        ))(i)
+        if let Ok((i, stmt)) = map(dialect.identifier(), CacheInner::from)(i) {
+            Ok((i, stmt))
+        } else {
+            let sqlparser_dialect: &dyn sqlparser::dialect::Dialect = match dialect {
+                Dialect::MySQL => &sqlparser::dialect::MySqlDialect {},
+                Dialect::PostgreSQL => &sqlparser::dialect::PostgreSqlDialect {},
+            };
+            // TODO: add any modicum of actual error handling; just hacking in some [`LocatedSpans`] to have an error
+            // message because [`NomSqlError`] doesn't have any variant for arbitrary error messages
+            let mut parser = sqlparser::parser::Parser::new(sqlparser_dialect)
+                .try_with_sql(
+                    str::from_utf8(i.as_bytes())
+                        .inspect(|f| {
+                            dbg!(f);
+                        })
+                        .map_err(|e| {
+                            dbg!(e);
+                            nom::Err::Error(NomSqlError {
+                                input: LocatedSpan::new("not utf-8".as_bytes()),
+                                kind: ErrorKind::Fail,
+                            })
+                        })?,
+                )
+                .map_err(|e| {
+                    dbg!(e);
+                    nom::Err::Error(NomSqlError {
+                        input: LocatedSpan::new("couldn't tokenize".as_bytes()),
+                        kind: ErrorKind::Fail,
+                    })
+                })?;
+            let statement: SqlQuery = parser
+                .parse_statement()
+                .map_err(|e| {
+                    dbg!(e);
+                    nom::Err::Error(NomSqlError {
+                        input: LocatedSpan::new("failed to parse".as_bytes()),
+                        kind: ErrorKind::Fail,
+                    })
+                })?
+                .into();
+            if let SqlQuery::Select(select) = statement {
+                let (i, _) = i.take_split(i.len());
+                Ok((i, CacheInner::Statement(Box::new(dbg!(select)))))
+            } else {
+                Err(nom::Err::Error(NomSqlError {
+                    input: LocatedSpan::new("unexpected non-select statement".as_bytes()),
+                    kind: ErrorKind::Fail,
+                }))
+            }
+        }
     }
 }
 
@@ -2465,12 +2513,13 @@ mod tests {
         fn display_create_query_cache() {
             let stmt = test_parse!(
                 create_cached_query(Dialect::PostgreSQL),
-                b"CREATE CACHE foo FROM SELECT id FROM users WHERE name = ?"
+                b"CREATE CACHE foo FROM SELECT id FROM users WHERE name = $1"
             );
             let res = stmt.display(Dialect::PostgreSQL).to_string();
+            dbg!(stmt.inner.unwrap());
             assert_eq!(
                 res,
-                "CREATE CACHE \"foo\" FROM SELECT \"id\" FROM \"users\" WHERE (\"name\" = ?)"
+                "CREATE CACHE \"foo\" FROM SELECT \"id\" FROM \"users\" WHERE (\"name\" = $1)"
             );
         }
 
