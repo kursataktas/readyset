@@ -15,12 +15,13 @@ use mir::node::{GroupedNodeType, MirNode, ProjectExpr, ViewKeyColumn};
 use mir::query::{MirBase, MirQuery};
 use mir::DfNodeIndex;
 pub use mir::{Column, NodeIndex};
+use nom_sql::analysis::visit::{walk_expr, Visitor};
 use nom_sql::analysis::ReferredColumns;
 use nom_sql::{
-    BinaryOperator, CaseWhenBranch, ColumnSpecification, CompoundSelectOperator, CreateTableBody,
-    DialectDisplay, Expr, FieldDefinitionExpr, FieldReference, FunctionExpr, InValue, LimitClause,
-    Literal, NonReplicatedRelation, OrderBy, OrderClause, OrderType, Relation, SelectStatement,
-    SqlIdentifier, TableKey, UnaryOperator,
+    analysis, BinaryOperator, CaseWhenBranch, ColumnSpecification, CompoundSelectOperator,
+    CreateTableBody, DialectDisplay, Expr, FieldDefinitionExpr, FieldReference, FunctionExpr,
+    GroupByClause, InValue, LimitClause, Literal, NonReplicatedRelation, OrderBy, OrderClause,
+    OrderType, Relation, SelectStatement, SqlIdentifier, TableExprInner, TableKey, UnaryOperator,
 };
 use petgraph::visit::Reversed;
 use petgraph::Direction;
@@ -29,9 +30,10 @@ use readyset_errors::{
     internal, internal_err, invalid_query, invalid_query_err, invariant, invariant_eq, unsupported,
     ReadySetError, ReadySetResult,
 };
-use readyset_sql_passes::is_correlated;
+use readyset_sql_passes::{is_correlated, outermost_table_exprs};
 use readyset_util::redacted::Sensitive;
 use tracing::{debug, trace};
+use Expr::NestedSelect;
 
 use super::query_graph::{extract_limit_offset, JoinPredicate};
 use crate::controller::sql::mir::grouped::{
@@ -182,6 +184,12 @@ pub(super) struct SqlToMirConverter {
     /// replicated (either due to lack of support, or because the user explicitly opted out from
     /// them being replicated)
     pub(in crate::controller::sql) non_replicated_relations: HashSet<NonReplicatedRelation>,
+}
+
+enum SubqueryContext {
+    In,
+    NotIn,
+    Scalar,
 }
 
 impl SqlToMirConverter {
@@ -1492,6 +1500,297 @@ impl SqlToMirConverter {
         }
     }
 
+    fn extract_from_lhs(
+        &mut self,
+        query_name: &Relation,
+        lhs: &Expr,
+        parent: NodeIndex,
+        text_context: &str,
+    ) -> (nom_sql::Column, NodeIndex) {
+        match lhs {
+            Expr::Column(col) => (col.clone(), parent),
+            expr => {
+                // The lhs is a non-column expr, so we need to project it first
+                let label = lhs.display(nom_sql::Dialect::MySQL).to_string();
+                let prj = self.make_project_node(
+                    query_name,
+                    self.generate_label(&format!("{}_lhs_project", text_context).into()),
+                    parent,
+                    self.mir_graph
+                        .columns(parent)
+                        .into_iter()
+                        .map(ProjectExpr::Column)
+                        .chain(iter::once(ProjectExpr::Expr {
+                            alias: label.clone().into(),
+                            expr: expr.clone(),
+                        }))
+                        .collect(),
+                );
+                (
+                    nom_sql::Column {
+                        name: label.into(),
+                        table: None,
+                    },
+                    prj,
+                )
+            }
+        }
+    }
+
+    fn get_single_aggregated_select_item(subquery: &SelectStatement) -> Option<&Expr> {
+        if subquery.fields.len() == 1 {
+            let field = subquery.fields.first().unwrap();
+            if let FieldDefinitionExpr::Expr { expr, .. } = field {
+                if analysis::contains_aggregate(expr) {
+                    return Some(expr);
+                }
+            }
+        }
+        None
+    }
+
+    fn get_groupby_columns(group_by: &GroupByClause) -> ReadySetResult<HashSet<nom_sql::Column>> {
+        let mut columns = HashSet::with_capacity(group_by.fields.len());
+        if group_by.fields.iter().all(|f| match f {
+            FieldReference::Expr(Expr::Column(col)) => {
+                columns.insert(col.clone());
+                true
+            }
+            _ => false,
+        }) {
+            Ok(columns)
+        } else {
+            invalid_query!("Unsupported GROUP BY item")
+        }
+    }
+
+    fn get_correlated_columns_from_where_clause(
+        select: &SelectStatement,
+    ) -> ReadySetResult<HashSet<nom_sql::Column>> {
+        struct EqualComparisonVisitor {
+            local_tables: HashSet<Relation>,
+            correlated_columns: HashSet<nom_sql::Column>,
+        }
+
+        /// The visitor collects those columns from the WHERE clause, which are
+        /// either left or right side of EQ comparison against a table.column from
+        /// the outer space. It only visits AND nodes, ignoring others, relying on
+        /// the fact, that unsupported use cases will error out later on, when
+        /// we try to pull the correlated constraints outwards. So, here we just
+        /// want to collect the columns used in valid correlated EQ constraints,
+        /// and compare them with the GROUP BY keys.
+        impl<'ast> Visitor<'ast> for EqualComparisonVisitor {
+            type Error = std::convert::Infallible;
+
+            fn visit_expr(&mut self, expr: &'ast Expr) -> Result<(), Self::Error> {
+                match expr {
+                    Expr::BinaryOp {
+                        lhs,
+                        op: BinaryOperator::Equal,
+                        rhs,
+                    } => {
+                        if let (Expr::Column(lhs_column), Expr::Column(rhs_column)) =
+                            (&**lhs, &**rhs)
+                        {
+                            if let (
+                                nom_sql::Column {
+                                    name: _,
+                                    table: Some(lhs_table),
+                                },
+                                nom_sql::Column {
+                                    name: _,
+                                    table: Some(rhs_table),
+                                },
+                            ) = (lhs_column, rhs_column)
+                            {
+                                let lhs_is_correlated = !self.local_tables.contains(lhs_table);
+                                let rhs_is_correlated = !self.local_tables.contains(rhs_table);
+                                if lhs_is_correlated && rhs_is_correlated {
+                                    todo!("Both sides of the comparison are from the outer scope.");
+                                } else if lhs_is_correlated {
+                                    self.correlated_columns.insert(rhs_column.clone());
+                                } else {
+                                    self.correlated_columns.insert(lhs_column.clone());
+                                }
+                            }
+                        }
+                    }
+                    Expr::BinaryOp {
+                        lhs: _,
+                        op: BinaryOperator::And,
+                        rhs: _,
+                    } => {
+                        walk_expr(self, expr)?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = EqualComparisonVisitor {
+            local_tables: outermost_table_exprs(select)
+                .filter_map(|tab_expr| match tab_expr.inner {
+                    TableExprInner::Table(ref relation) => Some(relation.clone()),
+                    _ => None,
+                })
+                .collect(),
+            correlated_columns: Default::default(),
+        };
+
+        if let Some(ref where_clause) = select.where_clause {
+            visitor.visit_expr(where_clause).expect("Just checked");
+        }
+
+        Ok(visitor.correlated_columns)
+    }
+
+    /// Scalar subquery should return a single value, in order to be a valid construct.
+    /// In case of a correlated scalar subquery, it should return a single value for each
+    /// invocation. Upstream DB(s), MySQL/PostgreSQL implement run-time verification and
+    /// error, in case the subquery return more than 1 row for each invocation (practically,
+    /// it verifies the replacement join has only single match for each left side table).
+    ///
+    /// Since ReadySet does not have such verification during run-time, currently we
+    /// only support EQ correlated constraints in the WHERE clause.
+    ///
+    /// Also, currently we only allow single use case for scalar subqueries, which
+    /// is EQ comparison in the WHERE clause. The EQ comparison requirement is coming
+    /// from the current subquery rewrite design (we might need to change in the future).
+    /// We need to investigate if subqueries can be used in the select list.
+    ///
+    /// So that, as the 1st phase, the verification passes if the subquery:
+    /// - has a single aggregated select item;
+    /// - either does not have GROUP BY clause, or the GROUP BY keys are all
+    ///   those local fields which are on either side of the correlated EQ constraints.
+    ///
+    /// For ex., these are valid use cases of correlated scalar subqueries:
+    /// select name, val from foo where val = (select sum(b) from foo1 where a = foo.id group by a);
+    /// select name, val from foo where val = (select sum(b) from foo1 where a = foo.id);
+    ///
+    /// These are NOT valid use cases of correlated scalar subqueries:
+    /// select name, val from foo where val = (select sum(b) from foo1 where a = foo.id group by b);
+    /// select name, val from foo where val = (select sum(b) from foo1 where a > foo.id group by a);
+    fn is_scalar_subquery_qualified(subquery: &SelectStatement) -> ReadySetResult<()> {
+        if Self::get_single_aggregated_select_item(subquery).is_some() {
+            if let Some(group_by) = &subquery.group_by {
+                if let Ok(groupby_columns) = Self::get_groupby_columns(group_by) {
+                    if let Ok(where_columns) =
+                        Self::get_correlated_columns_from_where_clause(subquery)
+                    {
+                        if !groupby_columns.eq(&where_columns) {
+                            invalid_query!("Subquery returns more than 1 row")
+                        }
+                    }
+                }
+            }
+        } else {
+            invalid_query!("Scalar subquery should be aggregated")
+        }
+        Ok(())
+    }
+
+    fn handle_in_and_scalar(
+        &mut self,
+        query_name: &Relation,
+        parent: NodeIndex,
+        lhs: &Expr,
+        subquery: &SelectStatement,
+        ctx: SubqueryContext,
+    ) -> ReadySetResult<NodeIndex> {
+        if let SubqueryContext::Scalar = ctx {
+            Self::is_scalar_subquery_qualified(subquery)?
+        }
+
+        let negated = matches!(ctx, SubqueryContext::NotIn);
+
+        let text_context = if matches!(ctx, SubqueryContext::In | SubqueryContext::NotIn) {
+            "in"
+        } else {
+            "scalar"
+        };
+
+        let (lhs, mut parent) = self.extract_from_lhs(query_name, lhs, parent, text_context);
+
+        // Remove rows where the lhs expr is NULL, since those would make the overall IN
+        // expr NULL in regular SQL.
+        //
+        // Note that we only need to do this for `NOT IN` since NULLs would never match in
+        // the rhs anyway
+        if negated {
+            parent = self.make_filter_node(
+                query_name,
+                self.generate_label(&"join_in_where_not_null".into()),
+                parent,
+                Expr::BinaryOp {
+                    lhs: Box::new(Expr::Column(lhs.clone())),
+                    op: BinaryOperator::IsNot,
+                    rhs: Box::new(Expr::Literal(Literal::Null)),
+                },
+            );
+        }
+
+        let query_graph = to_query_graph(subquery.clone())?;
+        let subquery_leaf = self.named_query_to_mir(
+            query_name,
+            &query_graph,
+            &HashMap::new(),
+            LeafBehavior::Anonymous,
+        )?;
+
+        let cols = self.columns(subquery_leaf);
+        if cols.len() != 1 {
+            invalid_query!(
+                "Subquery on right-hand side of \"{}\" expression must have exactly one column",
+                text_context
+            );
+        }
+
+        let col = cols.into_iter().next().expect("Just checked");
+        let distinct = self.make_distinct_node(
+            query_name,
+            self.generate_label(&format!("{}_subquery_distinct", text_context).into()),
+            subquery_leaf,
+            vec![col.clone()],
+        );
+
+        let join_preds = &[JoinPredicate {
+            left: lhs,
+            right: nom_sql::Column {
+                name: col.name,
+                table: col.table,
+            },
+        }];
+
+        let is_correlated = is_correlated(subquery);
+
+        let node_index = if negated {
+            self.make_antijoin(
+                query_name,
+                self.generate_label(&format!("join_not_{}_subquery", text_context).into()),
+                join_preds,
+                parent,
+                distinct,
+                /* dependent = */ is_correlated,
+            )?
+        } else {
+            self.make_join_node(
+                query_name,
+                self.generate_label(&format!("join_{}_subquery", text_context).into()),
+                join_preds,
+                parent,
+                distinct,
+                if is_correlated {
+                    JoinKind::DependentInner
+                } else {
+                    JoinKind::Inner
+                },
+            )?
+        };
+
+        Ok(node_index)
+    }
+
     fn make_predicate_nodes(
         &mut self,
         query_name: &Relation,
@@ -1589,109 +1888,41 @@ impl SqlToMirConverter {
                 // is compiled like
                 //
                 //     σ[mark IS NULL](R₁ ⟕[lhs ≡ rhs] π[DISTINCT x AS rhs, 0 AS mark](R₂))
-
-                let (lhs, mut parent) = match &**lhs {
-                    Expr::Column(col) => (col.clone(), parent),
-                    expr => {
-                        // The lhs is a non-column expr, so we need to project it first
-                        let label = lhs.display(nom_sql::Dialect::MySQL).to_string();
-                        let prj = self.make_project_node(
-                            query_name,
-                            self.generate_label(&"in_lhs_project".into()),
-                            parent,
-                            self.mir_graph
-                                .columns(parent)
-                                .into_iter()
-                                .map(ProjectExpr::Column)
-                                .chain(iter::once(ProjectExpr::Expr {
-                                    alias: label.clone().into(),
-                                    expr: expr.clone(),
-                                }))
-                                .collect(),
-                        );
-                        (
-                            nom_sql::Column {
-                                name: label.into(),
-                                table: None,
-                            },
-                            prj,
-                        )
-                    }
-                };
-
-                // Remove rows where the lhs expr is NULL, since those would make the overall IN
-                // expr NULL in regular SQL.
-                //
-                // Note that we only need to do this for `NOT IN` since NULLs would never match in
-                // the rhs anyway
-                if *negated {
-                    parent = self.make_filter_node(
-                        query_name,
-                        self.generate_label(&"join_in_where_not_null".into()),
-                        parent,
-                        Expr::BinaryOp {
-                            lhs: Box::new(Expr::Column(lhs.clone())),
-                            op: BinaryOperator::IsNot,
-                            rhs: Box::new(Expr::Literal(Literal::Null)),
-                        },
-                    );
-                }
-
-                let query_graph = to_query_graph((**subquery).clone())?;
-                let subquery_leaf = self.named_query_to_mir(
+                self.handle_in_and_scalar(
                     query_name,
-                    &query_graph,
-                    &HashMap::new(),
-                    LeafBehavior::Anonymous,
-                )?;
-
-                let cols = self.columns(subquery_leaf);
-                if cols.len() != 1 {
-                    invalid_query!(
-                        "Subquery on right-hand side of IN must have exactly one column"
-                    );
-                }
-                let col = cols.into_iter().next().expect("Just checked");
-                let distinct = self.make_distinct_node(
-                    query_name,
-                    self.generate_label(&"in_subquery_distinct".into()),
-                    subquery_leaf,
-                    vec![col.clone()],
-                );
-
-                let join_preds = &[JoinPredicate {
-                    left: lhs,
-                    right: nom_sql::Column {
-                        name: col.name,
-                        table: col.table,
+                    parent,
+                    lhs,
+                    subquery,
+                    if *negated {
+                        SubqueryContext::NotIn
+                    } else {
+                        SubqueryContext::In
                     },
-                }];
-
-                if *negated {
-                    self.make_antijoin(
-                        query_name,
-                        self.generate_label(&"join_not_in_subquery".into()),
-                        join_preds,
-                        parent,
-                        distinct,
-                        /* dependent = */ is_correlated(subquery),
-                    )?
-                } else {
-                    self.make_join_node(
-                        query_name,
-                        self.generate_label(&"join_in_subquery".into()),
-                        join_preds,
-                        parent,
-                        distinct,
-                        if is_correlated(subquery) {
-                            JoinKind::DependentInner
-                        } else {
-                            JoinKind::Inner
-                        },
-                    )?
-                }
+                )?
             }
-            Expr::NestedSelect(_) => unsupported!("Nested selects not supported in filters"),
+            Expr::BinaryOp {
+                lhs,
+                op: BinaryOperator::Equal,
+                rhs,
+            } if matches!(&**rhs, NestedSelect { .. }) => {
+                //     σ[lhs = π[x]R₂](R₁)
+                //
+                // is compiled like
+                //
+                //     R₁ ⋈[lhs = rhs] π[DISTINCT x AS rhs](R₂)
+                let subquery = match &**rhs {
+                    NestedSelect(subquery) => subquery,
+                    _ => unreachable!("Just checked"),
+                };
+                self.handle_in_and_scalar(
+                    query_name,
+                    parent,
+                    lhs,
+                    subquery,
+                    SubqueryContext::Scalar,
+                )?
+            }
+            NestedSelect(_) => unsupported!("Nested selects not supported in filters"),
             _ => self.make_filter_node(
                 query_name,
                 format!(
