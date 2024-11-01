@@ -1314,6 +1314,7 @@ async fn it_recovers_persisted_bases() {
         None,
         None,
         0,
+        Default::default(),
     );
 
     {
@@ -1395,6 +1396,7 @@ async fn it_recovers_persisted_bases_with_volume_id() {
         None,
         None,
         0,
+        Default::default(),
     );
 
     {
@@ -1470,6 +1472,7 @@ async fn it_doesnt_recover_persisted_bases_with_wrong_volume_id() {
         None,
         None,
         0,
+        Default::default(),
     );
 
     {
@@ -1715,6 +1718,7 @@ async fn it_recovers_persisted_bases_w_multiple_nodes() {
         None,
         None,
         0,
+        Default::default(),
     );
 
     {
@@ -1790,6 +1794,7 @@ async fn it_recovers_persisted_bases_w_multiple_nodes_and_volume_id() {
         None,
         None,
         0,
+        Default::default(),
     );
 
     {
@@ -8412,6 +8417,7 @@ async fn it_recovers_fully_materialized() {
         Some(dir.path().into()),
         None,
         0,
+        Default::default(),
     );
 
     let start = || {
@@ -8638,6 +8644,7 @@ async fn simple_drop_tables_with_persisted_data() {
         Some(path.clone()),
         None,
         0,
+        Default::default(),
     ));
     let (mut g, shutdown_tx) = builder.start_local().await.unwrap();
 
